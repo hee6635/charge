@@ -40,6 +40,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -48,6 +49,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -158,6 +160,7 @@ private fun MainContent(
         values = smooth(state.samples, 10_000) { it.powerW },
         color = MaterialTheme.colorScheme.primary,
         decimals = 1,
+        markers = state.events.map { it.timeMs },
     )
     LineChart(
         title = "온도 (°C) · 최근 5분",
@@ -167,6 +170,7 @@ private fun MainContent(
         color = Color(0xFFE5672B),
         decimals = 1,
     )
+    EventsCard(state.events)
     state.live?.let { LiveSessionCard(it) }
     DetailCard(s, state.capacityMah)
     CompareCard(state.history)
@@ -357,6 +361,7 @@ private fun LineChart(
     values: List<Float>,
     color: Color,
     decimals: Int,
+    markers: List<Long> = emptyList(),
 ) {
     val gridColor = MaterialTheme.colorScheme.outlineVariant
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
@@ -366,7 +371,14 @@ private fun LineChart(
         if (values.size < 2 || times.last() <= times.first()) {
             Text("데이터를 모으는 중…", color = muted, modifier = Modifier.padding(vertical = 24.dp))
         } else {
-            ChartBody(times, values, unit, color, decimals, gridColor, muted)
+            ChartBody(times, values, unit, color, decimals, gridColor, muted, markers)
+            if (markers.any { it >= times.first() }) {
+                Text(
+                    "세로선 = 변화 순간 (아래 '변화 기록' 참고)",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = muted,
+                )
+            }
         }
     }
 }
@@ -385,6 +397,7 @@ private fun ChartBody(
     decimals: Int,
     gridColor: Color,
     muted: Color,
+    markers: List<Long>,
 ) {
     var touchX by remember { mutableStateOf<Float?>(null) }
     var widthPx by remember { mutableStateOf(1f) }
@@ -447,6 +460,21 @@ private fun ChartBody(
             }
 
             val path = Path()
+            // 변화 순간 표시 (옅은 세로선 + 위쪽 점)
+            markers.forEach { m ->
+                if (m in t0..tN) {
+                    val mx = (m - t0) / span * size.width
+                    drawLine(
+                        muted.copy(alpha = 0.45f),
+                        Offset(mx, 0f),
+                        Offset(mx, size.height),
+                        strokeWidth = 1.dp.toPx(),
+                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(4.dp.toPx(), 4.dp.toPx())),
+                    )
+                    drawCircle(muted, radius = 3.dp.toPx(), center = Offset(mx, 3.dp.toPx()))
+                }
+            }
+
             // 점 사이를 곡선으로 이어서 꺾임 없이 보이게
             var prevX = x(0)
             var prevY = y(values[0])
@@ -474,6 +502,45 @@ private fun ChartBody(
             Text(agoText(tN - t0), style = MaterialTheme.typography.labelSmall, color = muted)
             Spacer(Modifier.weight(1f))
             Text("지금", style = MaterialTheme.typography.labelSmall, color = muted)
+        }
+    }
+}
+
+@Composable
+private fun EventsCard(events: List<ChargeEvent>) {
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    val fmt = remember { SimpleDateFormat("HH:mm", Locale.KOREA) }
+    SectionCard {
+        Text("변화 기록", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+        Text(
+            "무슨 일이 생겼을 때 전력이 어떻게 바뀌었는지 (30초 뒤 값과 비교)",
+            style = MaterialTheme.typography.bodySmall,
+            color = muted,
+        )
+        Spacer(Modifier.height(8.dp))
+        if (events.isEmpty()) {
+            Text("아직 기록된 변화가 없어요. 온도가 오르거나 화면을 켜고 끌 때 여기에 쌓여요.", color = muted)
+        }
+        events.take(12).forEachIndexed { i, e ->
+            if (i > 0) HorizontalDivider(Modifier.padding(vertical = 6.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(fmt.format(Date(e.timeMs)), style = MaterialTheme.typography.labelMedium, color = muted)
+                Spacer(Modifier.width(8.dp))
+                Text(e.icon, fontSize = 18.sp)
+                Spacer(Modifier.width(8.dp))
+                Text(e.text, modifier = Modifier.weight(1f))
+                Spacer(Modifier.width(8.dp))
+                val before = e.beforeW
+                val after = e.afterW
+                val change = when {
+                    after != null && after < 0 -> ""
+                    before != null && after != null -> "${before.f(1)} → ${after.f(1)} W"
+                    before != null -> "${before.f(1)} W → 측정 중"
+                    after != null -> "→ ${after.f(1)} W"
+                    else -> "측정 중"
+                }
+                Text(change, fontWeight = FontWeight.Medium, textAlign = TextAlign.End)
+            }
         }
     }
 }
@@ -646,26 +713,34 @@ private fun DiagnosisCard(d: Diagnosis, onResetBest: () -> Unit) {
         Text("충전 속도 진단", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(8.dp))
 
-        // 1) 지금 속도가 이 휴대폰 최고 기록의 몇 %인지
-        val ratio = d.ratio
-        val shownRatio = smoothly(ratio ?: 0.0)
-        val shownNowW = smoothly(d.nowW)
-        Row(verticalAlignment = Alignment.Bottom) {
-            Text(
-                if (ratio != null) "${(shownRatio * 100).roundToInt()}%" else d.speedLabel,
-                style = MaterialTheme.typography.displaySmall,
-                fontWeight = FontWeight.Bold,
-            )
-            if (ratio != null) {
-                Spacer(Modifier.width(8.dp))
-                Text(
-                    "최고 기록 대비 · ${d.speedLabel}",
-                    color = muted,
-                    modifier = Modifier.padding(bottom = 6.dp),
-                )
-            }
+        // 한 문장 요약 (예: "배터리가 38°C라서 휴대폰이 일부러 약 8W 줄였어요")
+        AnimatedContent(
+            targetState = d,
+            contentKey = { it.summaryKey },
+            transitionSpec = { fadeIn(tween(600)) togetherWith fadeOut(tween(400)) },
+            label = "summary",
+        ) { diag ->
+            Text(diag.summary, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
         }
-        if (ratio != null) {
+        Spacer(Modifier.height(12.dp))
+
+        val expected = d.expectedW
+        val shownNowW = smoothly(d.nowW)
+        val shownExpected = smoothly(expected ?: 0.0)
+        val shownRatio = smoothly(d.ratio ?: 0.0)
+        if (expected != null) {
+            // 원래 속도 → 지금 속도
+            Row(verticalAlignment = Alignment.Bottom) {
+                Column(Modifier.weight(1f)) {
+                    Text("원래 (이 잔량·화면 끔)", style = MaterialTheme.typography.bodySmall, color = muted)
+                    Text("${shownExpected.f(1)} W", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+                }
+                Text("→", style = MaterialTheme.typography.headlineSmall, color = muted)
+                Column(Modifier.weight(1f), horizontalAlignment = Alignment.End) {
+                    Text("지금 (30초 평균)", style = MaterialTheme.typography.bodySmall, color = muted)
+                    Text("${shownNowW.f(1)} W", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+                }
+            }
             Spacer(Modifier.height(8.dp))
             LinearProgressIndicator(
                 progress = { shownRatio.toFloat() },
@@ -674,17 +749,28 @@ private fun DiagnosisCard(d: Diagnosis, onResetBest: () -> Unit) {
                 gapSize = 0.dp,
                 drawStopIndicator = {},
             )
-            Spacer(Modifier.height(6.dp))
+            // 줄어든 몫을 원인별로
+            if (d.cuts.isNotEmpty()) {
+                Spacer(Modifier.height(10.dp))
+                d.cuts.forEach { cut ->
+                    key(cut.key) {
+                        val w = smoothly(cut.watts)
+                        Row(Modifier.fillMaxWidth().padding(vertical = 3.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text(cut.icon, fontSize = 18.sp)
+                            Spacer(Modifier.width(8.dp))
+                            Text(cut.label, modifier = Modifier.weight(1f))
+                            Text("−${w.f(1)} W", fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+        } else {
+            Text(
+                "지금 ${shownNowW.f(1)} W (30초 평균) · 비교할 기록을 모으는 중",
+                style = MaterialTheme.typography.bodySmall,
+                color = muted,
+            )
         }
-        Text(
-            buildString {
-                append("지금 ${shownNowW.f(1)} W")
-                d.bestW?.let { append(" · 이 휴대폰 최고 ${it.f(1)} W") }
-                append(" (30초 평균)")
-            },
-            style = MaterialTheme.typography.bodySmall,
-            color = muted,
-        )
 
         // 2) 느린 이유 (15초 넘게 같은 원인일 때만 바뀜)
         HorizontalDivider(Modifier.padding(vertical = 12.dp))
@@ -695,7 +781,9 @@ private fun DiagnosisCard(d: Diagnosis, onResetBest: () -> Unit) {
             label = "reason",
         ) { reason ->
             Column {
-                Text(reason.headline, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                Text("왜 그런가요?", style = MaterialTheme.typography.labelLarge, color = muted)
+                Spacer(Modifier.height(2.dp))
+                Text(reason.headline, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(4.dp))
                 Text(reason.detail, style = MaterialTheme.typography.bodyMedium)
             }
@@ -728,18 +816,19 @@ private fun DiagnosisCard(d: Diagnosis, onResetBest: () -> Unit) {
         HorizontalDivider(Modifier.padding(vertical = 12.dp))
         Text(
             "충전기에 적힌 W(예: 25W)는 '최대' 출력이에요. 휴대폰은 잔량·온도·화면 상태에 따라 필요한 만큼만 받아서, " +
-                "그 숫자가 그대로 들어오지는 않아요. 그래서 이 앱은 이 휴대폰이 실제로 받아본 최고 속도와 비교해요.",
+                "그 숫자가 그대로 들어오지는 않아요. 그래서 이 앱은 같은 잔량에서 화면 끄고 시원할 때 실제로 받았던 속도와 비교해요. " +
+                "줄어든 몫은 그 기록을 바탕으로 한 추정이에요.",
             style = MaterialTheme.typography.bodySmall,
             color = muted,
         )
-        if (d.bestW != null) {
-            TextButton(onClick = { confirmReset = true }) { Text("최고 기록 초기화") }
+        if (d.expectedW != null) {
+            TextButton(onClick = { confirmReset = true }) { Text("원래 속도 기록 초기화") }
         }
     }
     if (confirmReset) {
         AlertDialog(
             onDismissRequest = { confirmReset = false },
-            title = { Text("최고 기록을 지울까요?") },
+            title = { Text("원래 속도 기록을 지울까요?") },
             text = { Text("충전기나 케이블을 바꿨을 때 쓰세요. 다음 충전부터 다시 기록해요.") },
             confirmButton = {
                 TextButton(onClick = { onResetBest(); confirmReset = false }) { Text("초기화") }

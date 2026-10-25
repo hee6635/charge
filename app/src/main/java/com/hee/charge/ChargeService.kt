@@ -69,7 +69,7 @@ class ChargeService : Service() {
             title = "$icon · ${state.avgW10.f(1)} W · ${s.temperatureC.f(1)}°C · ${s.levelPercent}%"
             val parts = mutableListOf<String>()
             state.estimateMinutes?.let { parts += "완충까지 약 ${minutes(it)}" }
-            state.diagnosis?.let { if (it.reason.key != "best") parts += "느린 이유: ${it.reason.short}" }
+            state.diagnosis?.let { if (it.reason.key != "best" && it.cuts.isNotEmpty()) parts += it.summary }
             text = parts.joinToString(" · ").ifEmpty { "충전 중" }
         } else {
             title = "충전 안 함 · ${s.levelPercent}% · ${s.temperatureC.f(1)}°C"
@@ -95,6 +95,7 @@ class ChargeService : Service() {
             .setSmallIcon(R.drawable.ic_stat_charge)
             .setContentTitle(title)
             .setContentText(text)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
             .setContentIntent(open)
             .setOngoing(true)
             .setOnlyAlertOnce(true)

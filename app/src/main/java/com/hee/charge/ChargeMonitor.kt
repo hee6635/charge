@@ -16,6 +16,16 @@ import kotlin.math.max
 
 data class Sample(val timeMs: Long, val powerW: Double, val currentA: Double, val tempC: Double)
 
+/** 충전 중에 생긴 "변화 순간" (온도 넘음, 화면 켬/끔, 전력 급변 등) */
+data class ChargeEvent(
+    val timeMs: Long,
+    val icon: String,
+    val text: String,
+    val beforeW: Double?,
+    /** null = 아직 측정 중, 음수 = 표시 안 함 */
+    val afterW: Double?,
+)
+
 data class UiState(
     val snapshot: BatterySnapshot? = null,
     val samples: List<Sample> = emptyList(),
@@ -29,6 +39,8 @@ data class UiState(
     val avgW10: Double = 0.0,
     val avgA10: Double = 0.0,
     val backgroundEnabled: Boolean = false,
+    /** 최신이 앞 */
+    val events: List<ChargeEvent> = emptyList(),
 )
 
 /**
@@ -65,6 +77,12 @@ object ChargeMonitor {
     private var shownReason: Reason? = null
     private var candidateKey: String? = null
     private var candidateSinceMs = 0L
+
+    // 변화 순간 감지용
+    private val events = ArrayDeque<ChargeEvent>()
+    private var tempZone: Int? = null
+    private var lastInteractive: Boolean? = null
+    private var lastLevel: Int? = null
 
     fun init(context: Context) {
         if (::reader.isInitialized) return
@@ -130,14 +148,30 @@ object ChargeMonitor {
         val now = s.timeMs
 
         if (s.chargeType != lastType) {
+            val prev = lastType
             lastType = s.chargeType
             typeChangedMs = now
+            if (prev != null) {
+                when {
+                    s.chargeType.isCharging && !prev.isCharging ->
+                        addEvent(now, "🔌", "충전 시작 (${s.chargeType.label})", null)
+                    !s.chargeType.isCharging && prev.isCharging ->
+                        addEvent(now, "⏏", "충전기 분리 (${s.levelPercent}%)", null, done = true)
+                    else -> addEvent(now, "🔁", "충전 방식 바뀜 → ${s.chargeType.label}", null)
+                }
+            }
+            // 새로 꽂으면 온도·화면 기준을 다시 잡는다
+            tempZone = null
+            lastInteractive = null
+            lastLevel = null
         }
         // 꽂거나 뺀 직후 몇 초는 값이 튀므로 그래프·기록에서 뺀다
         val settled = now - typeChangedMs >= 3000
 
         if (settled) samples.addLast(Sample(now, s.powerW, s.currentA, s.temperatureC))
         while (samples.isNotEmpty() && now - samples.first().timeMs > WINDOW_MS) samples.removeFirst()
+
+        detectEvents(s, settled)
 
         // 화면 켜고 앱을 볼 때의 소비 전력을 방전 중에 배워둔다
         if (settled && !s.chargeType.isCharging && s.currentA < 0 && CLIENT_UI in clients && pm.isInteractive) {
@@ -192,21 +226,29 @@ object ChargeMonitor {
             null
         }
 
-        // 최고 기록은 "좋은 조건"(화면 꺼짐, 80% 미만)에서 30초 넘게 안정적으로 잰 값만 쓴다
+        // "원래 속도" 기록: 화면 꺼짐 + 시원할 때(37°C 미만) 30초 넘게 안정적으로 잰 값만 쓴다
         val wireless = s.chargeType.isWireless
         val interactive = pm.isInteractive
-        val goodCondition = !interactive && s.levelPercent < 80 && s.chargeType != ChargeType.WIRED_USB
-        if (charging && goodCondition && s.timeMs - typeChangedMs >= 33_000 && avgW30 > 0) {
-            val best = settings.bestW(wireless)
-            if (best == null || avgW30 > best) settings.setBestW(wireless, avgW30)
+        val bucket = (s.levelPercent / 10).coerceIn(0, 9)
+        val table = settings.expectedTable(wireless)
+        val goodCondition = !interactive && avgTemp30 < 37 && s.chargeType != ChargeType.WIRED_USB &&
+            s.status == android.os.BatteryManager.BATTERY_STATUS_CHARGING
+        if (charging && goodCondition && s.timeMs - typeChangedMs >= 33_000 && avgW30 > table[bucket]) {
+            table[bucket] = avgW30
+            settings.saveExpectedTable(wireless, table)
         }
+        val expectedW = expectedFor(table, bucket)
 
         val liveSession = live?.toSession()
         val usage = if (interactive) usageW ?: DEFAULT_USAGE_W else SCREEN_OFF_USAGE_W
         val diagnosis = if (charging) {
-            val bestW = settings.bestW(wireless)
-            val reason = stableReason(pickReason(s, avgW30, bestW, avgTemp30, usage, interactive), s.timeMs)
-            Diagnosis(avgW30, bestW, reason, buildFactors(s, avgTemp30, usage, interactive))
+            val reason = stableReason(pickReason(s, avgW30, expectedW, avgTemp30, usage, interactive), s.timeMs)
+            val (cuts, summary) = if (expectedW != null) {
+                splitGap(s, avgW30, expectedW, avgTemp30, usage, interactive)
+            } else {
+                emptyList<Cut>() to reason.headline
+            }
+            Diagnosis(avgW30, expectedW, reason, cuts, summary, buildFactors(s, avgTemp30, usage, interactive))
         } else {
             shownReason = null
             candidateKey = null
@@ -223,7 +265,92 @@ object ChargeMonitor {
             diagnosis = diagnosis,
             avgW10 = avgW10,
             avgA10 = avgA10,
+            events = events.reversed(),
         )
+    }
+
+    /** 이 잔량 구간의 원래 속도. 기록이 없으면 바로 옆 구간을 쓴다. */
+    private fun expectedFor(table: DoubleArray, bucket: Int): Double? {
+        if (table[bucket] > 0) return table[bucket]
+        val near = listOfNotNull(table.getOrNull(bucket - 1), table.getOrNull(bucket + 1)).filter { it > 0 }
+        return if (near.isEmpty()) null else near.average()
+    }
+
+    private fun addEvent(now: Long, icon: String, text: String, beforeW: Double?, done: Boolean = false) {
+        // done=true 면 "이후 전력"을 채우지 않는다 (분리 등)
+        events.addLast(ChargeEvent(now, icon, text, beforeW, if (done) -1.0 else null))
+        while (events.size > 40) events.removeFirst()
+    }
+
+    private fun tempZoneOf(t: Double) = when {
+        t >= 40 -> 3
+        t >= 37 -> 2
+        t >= 35 -> 1
+        else -> 0
+    }
+
+    private fun f1(v: Double) = String.format(java.util.Locale.US, "%.1f", v)
+
+    private fun detectEvents(s: BatterySnapshot, settled: Boolean) {
+        val now = s.timeMs
+        val avgW10 = avgOf(s, 10_000) { it.powerW } ?: s.powerW
+
+        // 30초 지난 이벤트에 "이후 전력"을 채운다
+        for (i in events.indices) {
+            val e = events[i]
+            if (e.afterW == null && now - e.timeMs >= 30_000) events[i] = e.copy(afterW = avgW10)
+        }
+        if (!s.chargeType.isCharging || !settled) return
+
+        // 온도 구간 변화 (내려갈 때는 0.5°C 여유를 둬서 들락날락 방지)
+        val temp = avgOf(s, 10_000) { it.tempC } ?: s.temperatureC
+        val zone = tempZoneOf(temp)
+        val curZone = tempZone
+        if (curZone == null) {
+            tempZone = zone
+        } else if (zone > curZone) {
+            tempZone = zone
+            val limit = when (zone) {
+                3 -> 40
+                2 -> 37
+                else -> 35
+            }
+            addEvent(now, "🌡", "배터리 ${limit}°C 넘음 (${f1(temp)}°C)", avgW10)
+        } else if (zone < curZone && tempZoneOf(temp + 0.5) < curZone) {
+            tempZone = zone
+            addEvent(now, "❄", "배터리 식음 (${f1(temp)}°C)", avgW10)
+        }
+
+        // 화면 켬/끔
+        val interactive = pm.isInteractive
+        val prevInteractive = lastInteractive
+        lastInteractive = interactive
+        if (prevInteractive != null && prevInteractive != interactive) {
+            addEvent(now, "📱", if (interactive) "화면 켬" else "화면 끔", avgW10)
+        }
+
+        // 잔량 50% / 80% 넘음
+        val level = s.levelPercent
+        val prevLevel = lastLevel
+        lastLevel = level
+        if (prevLevel != null) {
+            if (prevLevel < 50 && level >= 50) addEvent(now, "🔋", "50% 넘음 (속도가 줄어드는 구간)", avgW10)
+            if (prevLevel < 80 && level >= 80) addEvent(now, "🔋", "80% 넘음 (천천히 채우는 구간)", avgW10)
+        }
+
+        // 다른 변화 없이 전력이 크게 바뀐 경우: 30~40초 전과 비교
+        val past = samples.filter { now - it.timeMs in 30_000..40_000 }
+        val lastEventMs = events.lastOrNull()?.timeMs ?: 0L
+        if (past.size >= 3 && now - lastEventMs >= 45_000) {
+            val pastW = past.sumOf { it.powerW } / past.size
+            val diff = avgW10 - pastW
+            if (kotlin.math.abs(diff) >= maxOf(2.0, pastW * 0.25)) {
+                val why = shownReason?.short?.let { " · 지금 원인: $it" } ?: ""
+                val text = if (diff < 0) "전력 크게 떨어짐$why" else "전력 크게 올라감$why"
+                events.addLast(ChargeEvent(now, if (diff < 0) "📉" else "📈", text, pastW, avgW10))
+                while (events.size > 40) events.removeFirst()
+            }
+        }
     }
 
     private fun stableReason(next: Reason, now: Long): Reason {

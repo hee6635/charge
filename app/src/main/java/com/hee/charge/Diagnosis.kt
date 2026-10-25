@@ -11,29 +11,27 @@ data class Factor(val title: String, val value: String, val detail: String, val 
 /** 느려진 원인 하나 */
 data class Reason(val key: String, val short: String, val headline: String, val detail: String)
 
+/** "원래 속도"에서 깎인 몫 하나 (예: 온도 때문에 8W) */
+data class Cut(val key: String, val icon: String, val label: String, val watts: Double)
+
 /**
  * 충전 속도 진단. 순간값 대신 30초 평균을 쓴다.
- * 기준은 충전기 표기 출력이 아니라 이 휴대폰이 실제로 받아본 최고 속도.
+ * 기준(expectedW)은 충전기 표기가 아니라, 이 휴대폰이 같은 잔량대에서
+ * 화면 끄고 시원할 때 실제로 받아본 속도.
  */
 data class Diagnosis(
     val nowW: Double,
-    val bestW: Double?,
+    val expectedW: Double?,
     val reason: Reason,
+    val cuts: List<Cut>,
+    val summary: String,
     val factors: List<Factor>,
 ) {
-    /** 최고 기록 대비 지금 속도 (0~1) */
-    val ratio: Double? get() = bestW?.takeIf { it > 0 }?.let { (nowW / it).coerceIn(0.0, 1.0) }
+    /** 요약 문장이 "다른 내용"으로 바뀌었는지 판단하는 키 (숫자만 바뀌면 같은 키) */
+    val summaryKey: String get() = cuts.maxByOrNull { it.watts }?.key ?: reason.key
 
-    val speedLabel: String
-        get() {
-            val r = ratio ?: return "기록 쌓는 중"
-            return when {
-                r >= 0.85 -> "최고 속도"
-                r >= 0.6 -> "조금 느림"
-                r >= 0.35 -> "느림"
-                else -> "매우 느림"
-            }
-        }
+    /** 원래 속도 대비 지금 속도 (0~1) */
+    val ratio: Double? get() = expectedW?.takeIf { it > 0 }?.let { (nowW / it).coerceIn(0.0, 1.0) }
 }
 
 private fun Double.f1() = String.format(Locale.US, "%.1f", this)
@@ -42,14 +40,14 @@ private fun Double.f1() = String.format(Locale.US, "%.1f", this)
 fun pickReason(
     s: BatterySnapshot,
     avgW: Double,
-    bestW: Double?,
+    expectedW: Double?,
     tempC: Double,
     usageW: Double,
     interactive: Boolean,
 ): Reason {
     val level = s.levelPercent
     val thermal = s.thermalStatus ?: PowerManager.THERMAL_STATUS_NONE
-    val atBest = bestW != null && avgW >= bestW * 0.85
+    val atBest = expectedW != null && avgW >= expectedW * 0.85
     return when {
         s.status == BatteryManager.BATTERY_STATUS_NOT_CHARGING -> Reason(
             "paused",
@@ -65,9 +63,9 @@ fun pickReason(
         )
         atBest -> Reason(
             "best",
-            "최고 속도",
-            "지금 최고 속도로 충전 중이에요",
-            "이 휴대폰이 받아본 가장 빠른 속도와 비슷해요. 따로 막는 원인이 없어요.",
+            "정상 속도",
+            "원래 속도로 잘 받고 있어요",
+            "이 잔량에서 평소 받던 속도와 비슷해요. 따로 막는 원인이 없어요.",
         )
         s.chargeType.isWireless -> Reason(
             "wireless",
@@ -112,11 +110,11 @@ fun pickReason(
             "화면을 켜둬서 조금 느려졌어요",
             "휴대폰이 쓰는 전력(약 ${usageW.f1()}W)만큼 배터리로 덜 들어가요. 화면을 끄면 그만큼 빨라져요.",
         )
-        bestW == null -> Reason(
+        expectedW == null -> Reason(
             "learning",
             "기록 중",
-            "최고 속도를 기록하는 중이에요",
-            "백그라운드 측정을 켜고, 배터리가 낮을 때 화면을 끈 채 1분쯤 충전하면 이 휴대폰의 최고 속도가 기록돼요. 그다음부터 비교해서 알려드려요.",
+            "비교할 기록을 모으는 중이에요",
+            "백그라운드 측정을 켜고 화면을 끈 채 충전하면, 잔량별로 이 휴대폰이 원래 받는 속도가 기록돼요. 그다음부터 얼마나, 왜 줄었는지 알려드려요.",
         )
         else -> Reason(
             "device",
@@ -174,4 +172,47 @@ fun buildFactors(s: BatterySnapshot, tempC: Double, usageW: Double, interactive:
             },
         )
     }
+}
+
+/**
+ * 원래 속도와 지금 속도의 차이를 원인별로 나눈다.
+ * 화면 몫은 재둔 사용 전력, 나머지는 그때 상황(온도·잔량 등)에 돌린다.
+ */
+fun splitGap(
+    s: BatterySnapshot,
+    nowW: Double,
+    expectedW: Double,
+    tempC: Double,
+    usageW: Double,
+    interactive: Boolean,
+): Pair<List<Cut>, String> {
+    val gap = expectedW - nowW
+    if (gap <= maxOf(0.5, expectedW * 0.1)) {
+        return emptyList<Cut>() to "이 잔량에서 원래 받던 만큼 잘 받고 있어요"
+    }
+    val cuts = mutableListOf<Cut>()
+    var rest = gap
+    if (interactive) {
+        val screen = minOf(usageW, rest)
+        cuts += Cut("screen", "📱", "화면 켜짐 → 휴대폰이 사용", screen)
+        rest -= screen
+    }
+    val thermal = s.thermalStatus ?: PowerManager.THERMAL_STATUS_NONE
+    if (rest > 0.3) {
+        cuts += when {
+            s.status == BatteryManager.BATTERY_STATUS_NOT_CHARGING ->
+                Cut("paused", "⏸", "충전 멈춤 (보호 설정·온도)", rest)
+            tempC >= 35 || thermal >= PowerManager.THERMAL_STATUS_MODERATE ->
+                Cut("temp", "🌡", "배터리 ${tempC.f1()}°C → 발열 때문에 줄임", rest)
+            else -> Cut("unknown", "❓", "뚜렷한 원인 없음 (케이블·사용량 확인)", rest)
+        }
+    }
+    val main = cuts.maxBy { it.watts }
+    val summary = when (main.key) {
+        "temp" -> "배터리가 ${tempC.f1()}°C라서 휴대폰이 일부러 약 ${main.watts.f1()}W 줄였어요"
+        "screen" -> "화면을 켜둬서 약 ${main.watts.f1()}W를 휴대폰이 쓰고 있어요"
+        "paused" -> "휴대폰이 충전을 잠시 멈춰서 약 ${main.watts.f1()}W 덜 받고 있어요"
+        else -> "원래보다 약 ${gap.f1()}W 덜 받는데 뚜렷한 원인이 안 보여요"
+    }
+    return cuts to summary
 }

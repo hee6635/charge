@@ -14,14 +14,24 @@ class Settings(context: Context) {
         get() = getDouble("usageW")
         set(v) = putDouble("usageW", v)
 
-    /** 이 휴대폰이 받아본 최고 충전 속도 (30초 평균, 유선/무선 따로) */
-    fun bestW(wireless: Boolean): Double? = getDouble(if (wireless) "bestWireless" else "bestWired")
+    /**
+     * 잔량 구간(10% 단위)별로 "좋은 조건"(화면 꺼짐, 시원함)에서 받아본 최고 속도 (30초 평균, W).
+     * 0이면 아직 기록 없음. 유선/무선 따로.
+     */
+    fun expectedTable(wireless: Boolean): DoubleArray {
+        val parts = p.getString(tableKey(wireless), null)?.split(",") ?: emptyList()
+        return DoubleArray(10) { parts.getOrNull(it)?.toDoubleOrNull() ?: 0.0 }
+    }
 
-    fun setBestW(wireless: Boolean, w: Double) = putDouble(if (wireless) "bestWireless" else "bestWired", w)
+    fun saveExpectedTable(wireless: Boolean, table: DoubleArray) {
+        p.edit().putString(tableKey(wireless), table.joinToString(",")).apply()
+    }
 
     fun resetBest() {
-        p.edit().remove("bestWireless").remove("bestWired").apply()
+        p.edit().remove(tableKey(true)).remove(tableKey(false)).apply()
     }
+
+    private fun tableKey(wireless: Boolean) = if (wireless) "expectedWireless" else "expectedWired"
 
     private fun getDouble(key: String): Double? = p.getFloat(key, -1f).takeIf { it > 0f }?.toDouble()
 
