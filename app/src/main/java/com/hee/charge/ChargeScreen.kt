@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -22,6 +23,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -81,6 +84,8 @@ fun ChargeScreen(
     state: UiState,
     keepScreenOn: Boolean,
     onKeepScreenOnChange: (Boolean) -> Unit,
+    onBackgroundChange: (Boolean) -> Unit,
+    onChargerWChange: (Int) -> Unit,
     onClearHistory: () -> Unit,
 ) {
     Scaffold { padding ->
@@ -96,7 +101,9 @@ fun ChargeScreen(
             if (s == null) {
                 Text("배터리 정보를 읽는 중…", modifier = Modifier.padding(24.dp))
             } else {
-                MainContent(state, s, keepScreenOn, onKeepScreenOnChange, onClearHistory)
+                MainContent(
+                    state, s, keepScreenOn, onKeepScreenOnChange, onBackgroundChange, onChargerWChange, onClearHistory,
+                )
             }
         }
     }
@@ -108,14 +115,29 @@ private fun MainContent(
     s: BatterySnapshot,
     keepScreenOn: Boolean,
     onKeepScreenOnChange: (Boolean) -> Unit,
+    onBackgroundChange: (Boolean) -> Unit,
+    onChargerWChange: (Int) -> Unit,
     onClearHistory: () -> Unit,
 ) {
+    val times = state.samples.map { it.timeMs }
     HeaderCard(s)
+    ToggleCard(
+        title = "백그라운드 측정",
+        subtitle = if (state.backgroundEnabled) {
+            "앱을 닫거나 화면을 꺼도 계속 기록해요 (알림창에 표시)"
+        } else {
+            "꺼짐: 앱이 화면에 떠 있을 때만 기록해요"
+        },
+        checked = state.backgroundEnabled,
+        onChange = onBackgroundChange,
+    )
     MetricsGrid(s)
+    state.diagnosis?.let { DiagnosisCard(it, onChargerWChange) }
     EstimateCard(state, s)
     LineChart(
         title = "전력 (W) · 최근 5분",
         unit = "W",
+        times = times,
         values = state.samples.map { it.powerW.toFloat() },
         color = MaterialTheme.colorScheme.primary,
         decimals = 1,
@@ -123,6 +145,7 @@ private fun MainContent(
     LineChart(
         title = "온도 (°C) · 최근 5분",
         unit = "°C",
+        times = times,
         values = state.samples.map { it.tempC.toFloat() },
         color = Color(0xFFE5672B),
         decimals = 1,
@@ -131,10 +154,15 @@ private fun MainContent(
     DetailCard(s, state.capacityMah)
     CompareCard(state.history)
     HistoryCard(state.history, onClearHistory)
-    SettingsCard(keepScreenOn, onKeepScreenOnChange)
+    ToggleCard(
+        title = "화면 켜두기",
+        subtitle = "충전하면서 계속 지켜볼 때 켜세요",
+        checked = keepScreenOn,
+        onChange = onKeepScreenOnChange,
+    )
     Text(
         "· 값은 휴대폰 배터리 센서 기준이며, 기기마다 정확도가 다를 수 있어요.\n" +
-            "· 충전 기록은 앱이 켜져 있는 동안 측정한 값으로 저장돼요.",
+            "· 충전 진단의 사용 전력·열 손실은 추정치예요. 배터리 전력만 실제 측정값이에요.",
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
@@ -273,22 +301,42 @@ private fun EstimateCard(state: UiState, s: BatterySnapshot) {
 
 /** 단일 시리즈 라인 차트. 누르고 있으면 그 시점의 값을 보여준다. */
 @Composable
-private fun LineChart(title: String, unit: String, values: List<Float>, color: Color, decimals: Int) {
+private fun LineChart(
+    title: String,
+    unit: String,
+    times: List<Long>,
+    values: List<Float>,
+    color: Color,
+    decimals: Int,
+) {
     val gridColor = MaterialTheme.colorScheme.outlineVariant
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
 
     SectionCard {
         Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-        if (values.size < 2) {
+        if (values.size < 2 || times.last() <= times.first()) {
             Text("데이터를 모으는 중…", color = muted, modifier = Modifier.padding(vertical = 24.dp))
         } else {
-            ChartBody(values, unit, color, decimals, gridColor, muted)
+            ChartBody(times, values, unit, color, decimals, gridColor, muted)
         }
     }
 }
 
+private fun agoText(ms: Long): String {
+    val sec = (ms / 1000).toInt().coerceAtLeast(0)
+    return if (sec >= 60) "${sec / 60}분 ${sec % 60}초 전" else "${sec}초 전"
+}
+
 @Composable
-private fun ChartBody(values: List<Float>, unit: String, color: Color, decimals: Int, gridColor: Color, muted: Color) {
+private fun ChartBody(
+    times: List<Long>,
+    values: List<Float>,
+    unit: String,
+    color: Color,
+    decimals: Int,
+    gridColor: Color,
+    muted: Color,
+) {
     var touchX by remember { mutableStateOf<Float?>(null) }
     var widthPx by remember { mutableStateOf(1f) }
     Column {
@@ -298,11 +346,16 @@ private fun ChartBody(values: List<Float>, unit: String, color: Color, decimals:
         val lo = minV - range * 0.1f
         val hi = maxV + range * 0.1f
 
+        // 측정 간격이 1초/2초로 바뀔 수 있어서 가로축은 실제 시각 기준
+        val t0 = times.first()
+        val tN = times.last()
+        val span = (tN - t0).toFloat()
         val touchedIndex = touchX?.let { x ->
-            ((x / widthPx) * (values.size - 1)).roundToInt().coerceIn(0, values.size - 1)
+            val target = t0 + (x / widthPx).coerceIn(0f, 1f) * span
+            times.indices.minByOrNull { kotlin.math.abs(times[it] - target) }
         }
         val headerValue = touchedIndex?.let { values[it] } ?: values.last()
-        val headerLabel = touchedIndex?.let { "${values.size - 1 - it}초 전" } ?: "현재"
+        val headerLabel = touchedIndex?.let { agoText(tN - times[it]) } ?: "현재"
 
         Row(verticalAlignment = Alignment.Bottom) {
             Text(
@@ -337,7 +390,7 @@ private fun ChartBody(values: List<Float>, unit: String, color: Color, decimals:
         ) {
             widthPx = size.width
             fun y(v: Float) = size.height - (v - lo) / (hi - lo) * size.height
-            fun x(i: Int) = i.toFloat() / (values.size - 1) * size.width
+            fun x(i: Int) = (times[i] - t0) / span * size.width
 
             // 옅은 기준선 (최소/최대)
             listOf(minV, maxV).forEach { v ->
@@ -360,7 +413,7 @@ private fun ChartBody(values: List<Float>, unit: String, color: Color, decimals:
             drawCircle(color, radius = 4.dp.toPx(), center = Offset(px, py))
         }
         Row(Modifier.fillMaxWidth()) {
-            Text("${values.size - 1}초 전", style = MaterialTheme.typography.labelSmall, color = muted)
+            Text(agoText(tN - t0), style = MaterialTheme.typography.labelSmall, color = muted)
             Spacer(Modifier.weight(1f))
             Text("지금", style = MaterialTheme.typography.labelSmall, color = muted)
         }
@@ -477,7 +530,7 @@ private fun HistoryCard(history: List<ChargeSession>, onClear: () -> Unit) {
         }
         if (history.isEmpty()) {
             Text(
-                "아직 기록이 없어요. 앱을 켠 채로 1분 이상 충전하면 저장돼요.",
+                "아직 기록이 없어요. 1분 이상 충전하면 저장돼요. (백그라운드 측정을 켜면 앱을 닫아도 기록돼요)",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
@@ -510,18 +563,120 @@ private fun HistoryCard(history: List<ChargeSession>, onClear: () -> Unit) {
 }
 
 @Composable
-private fun SettingsCard(keepScreenOn: Boolean, onChange: (Boolean) -> Unit) {
+private fun ToggleCard(title: String, subtitle: String, checked: Boolean, onChange: (Boolean) -> Unit) {
     SectionCard {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
-                Text("화면 켜두기", fontWeight = FontWeight.Medium)
+                Text(title, fontWeight = FontWeight.Medium)
                 Text(
-                    "충전하면서 계속 지켜볼 때 켜세요",
+                    subtitle,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            Switch(checked = keepScreenOn, onCheckedChange = onChange)
+            Spacer(Modifier.width(8.dp))
+            Switch(checked = checked, onCheckedChange = onChange)
+        }
+    }
+}
+
+private val BatteryColor = Color(0xFF2F6FDE)
+private val UsageColor = Color(0xFF14A38B)
+private val LossColor = Color(0xFFE08A1E)
+
+private val ChargerOptions = listOf(10, 15, 25, 45, 65)
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun DiagnosisCard(d: Diagnosis, onChargerWChange: (Int) -> Unit) {
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    val unusedColor = MaterialTheme.colorScheme.outlineVariant
+    SectionCard {
+        Text(
+            "왜 ${d.chargerW}W가 다 안 들어올까?",
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold,
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(d.headline, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(4.dp))
+        Text(d.detail, style = MaterialTheme.typography.bodyMedium)
+
+        // 충전기 출력이 어디로 갔는지 나눠 보여주는 막대
+        Spacer(Modifier.height(16.dp))
+        val parts = listOf(
+            Triple("배터리로 들어감", d.batteryW, BatteryColor),
+            Triple("휴대폰 사용 (추정)", d.usageW, UsageColor),
+            Triple("열 손실 (추정)", d.lossW, LossColor),
+            Triple("받지 못한 양", d.unusedW, unusedColor),
+        )
+        val total = parts.sumOf { it.second }.coerceAtLeast(d.chargerW.toDouble()).coerceAtLeast(0.1)
+        Canvas(Modifier.fillMaxWidth().height(20.dp)) {
+            val gap = 2.dp.toPx()
+            val radius = androidx.compose.ui.geometry.CornerRadius(4.dp.toPx())
+            var x = 0f
+            parts.forEach { (_, w, c) ->
+                val segW = (w / total * size.width).toFloat()
+                if (segW >= 1f) {
+                    drawRoundRect(
+                        color = c,
+                        topLeft = Offset(x, 0f),
+                        size = androidx.compose.ui.geometry.Size((segW - gap).coerceAtLeast(1f), size.height),
+                        cornerRadius = radius,
+                    )
+                }
+                x += segW
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        parts.forEach { (label, w, c) ->
+            Row(Modifier.fillMaxWidth().padding(vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.size(10.dp).background(c, RoundedCornerShape(2.dp)))
+                Spacer(Modifier.width(8.dp))
+                Text(label, color = muted, modifier = Modifier.weight(1f))
+                Text("${w.f(1)} W", fontWeight = FontWeight.Medium)
+            }
+        }
+
+        // 원인 체크리스트
+        HorizontalDivider(Modifier.padding(vertical = 12.dp))
+        d.factors.forEach { f ->
+            val (mark, color) = when (f.level) {
+                Level.OK -> "✓" to Good
+                Level.INFO -> "!" to Warn
+                Level.WARN -> "!" to Critical
+            }
+            Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    Modifier.size(20.dp).background(color, CircleShape),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(mark, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                }
+                Spacer(Modifier.width(10.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(f.title, fontWeight = FontWeight.Medium)
+                    Text(f.detail, style = MaterialTheme.typography.bodySmall, color = muted)
+                }
+                Text(f.value, fontWeight = FontWeight.Medium)
+            }
+        }
+
+        // 충전기 출력 선택
+        HorizontalDivider(Modifier.padding(vertical = 12.dp))
+        Text("내 충전기 최대 출력", style = MaterialTheme.typography.labelLarge, color = muted)
+        Spacer(Modifier.height(4.dp))
+        Row(
+            modifier = Modifier.horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            ChargerOptions.forEach { w ->
+                FilterChip(
+                    selected = d.chargerW == w,
+                    onClick = { onChargerWChange(w) },
+                    label = { Text("${w}W") },
+                )
+            }
         }
     }
 }
