@@ -52,7 +52,7 @@ class MainActivity : ComponentActivity() {
                     keepScreenOn = keepScreenOn,
                     onKeepScreenOnChange = { keepScreenOn = it },
                     onBackgroundChange = ::setBackground,
-                    onChargerWChange = ChargeMonitor::setChargerW,
+                    onResetBest = ChargeMonitor::resetBest,
                     onClearHistory = ChargeMonitor::clearHistory,
                 )
             }

@@ -3,162 +3,175 @@ package com.hee.charge
 import android.os.BatteryManager
 import android.os.PowerManager
 import java.util.Locale
-import kotlin.math.max
 
 enum class Level { OK, INFO, WARN }
 
 data class Factor(val title: String, val value: String, val detail: String, val level: Level)
 
+/** 느려진 원인 하나 */
+data class Reason(val key: String, val short: String, val headline: String, val detail: String)
+
 /**
- * 충전기 출력이 어디로 갔는지 나눠서 보여주기 위한 값.
- * 배터리 전력만 실제 측정값이고, 사용 전력·손실은 추정이다.
+ * 충전 속도 진단. 순간값 대신 30초 평균을 쓴다.
+ * 기준은 충전기 표기 출력이 아니라 이 휴대폰이 실제로 받아본 최고 속도.
  */
 data class Diagnosis(
-    val chargerW: Int,
-    val batteryW: Double,
-    val usageW: Double,
-    val lossW: Double,
-    val unusedW: Double,
-    val reasonShort: String,
-    val headline: String,
-    val detail: String,
+    val nowW: Double,
+    val bestW: Double?,
+    val reason: Reason,
     val factors: List<Factor>,
-)
+) {
+    /** 최고 기록 대비 지금 속도 (0~1) */
+    val ratio: Double? get() = bestW?.takeIf { it > 0 }?.let { (nowW / it).coerceIn(0.0, 1.0) }
+
+    val speedLabel: String
+        get() {
+            val r = ratio ?: return "기록 쌓는 중"
+            return when {
+                r >= 0.85 -> "최고 속도"
+                r >= 0.6 -> "조금 느림"
+                r >= 0.35 -> "느림"
+                else -> "매우 느림"
+            }
+        }
+}
 
 private fun Double.f1() = String.format(Locale.US, "%.1f", this)
 
-fun diagnose(
+/** 지금 상황에서 가장 큰 원인을 고른다 (위에 있을수록 우선) */
+fun pickReason(
     s: BatterySnapshot,
-    live: ChargeSession?,
-    chargerW: Int,
+    avgW: Double,
+    bestW: Double?,
+    tempC: Double,
     usageW: Double,
     interactive: Boolean,
-): Diagnosis {
-    val batteryW = max(s.powerW, 0.0)
-    val lossRate = if (s.chargeType.isWireless) 0.30 else 0.12
-    val inputW = (batteryW + usageW) / (1 - lossRate)
-    val lossW = inputW - batteryW - usageW
-    val unusedW = max(0.0, chargerW - inputW)
-
-    val t = s.temperatureC
+): Reason {
     val level = s.levelPercent
     val thermal = s.thermalStatus ?: PowerManager.THERMAL_STATUS_NONE
-    val notCharging = s.status == BatteryManager.BATTERY_STATUS_NOT_CHARGING
-    val nearMax = inputW >= chargerW * 0.8
-    val peak = live?.maxW ?: 0.0
-
-    // 가장 큰 원인 하나를 고른다 (위에 있을수록 우선)
-    val (short, headline, detail) = when {
-        notCharging -> Triple(
+    val atBest = bestW != null && avgW >= bestW * 0.85
+    return when {
+        s.status == BatteryManager.BATTERY_STATUS_NOT_CHARGING -> Reason(
+            "paused",
             "충전 멈춤",
             "충전이 잠시 멈춰 있어요",
             "배터리 보호 설정(예: 85%까지만 충전)이나 높은 온도 때문에 휴대폰이 충전을 멈췄어요.",
         )
-        s.chargeType == ChargeType.WIRED_USB -> Triple(
+        s.chargeType == ChargeType.WIRED_USB -> Reason(
+            "usb",
             "USB 포트",
             "USB 포트라서 전력이 작아요",
             "컴퓨터 USB 포트 등은 보통 2.5~7.5W만 줘요. 벽 충전기에 꽂으면 빨라져요.",
         )
-        s.chargeType.isWireless -> Triple(
-            "무선 충전",
-            "무선 충전은 원래 느리고 손실이 커요",
-            "코일로 전달하면서 30% 안팎이 열로 사라지고, 무선 최대 속도도 유선보다 낮아요. " +
-                "휴대폰 위치가 어긋나면 더 느려져요.",
+        atBest -> Reason(
+            "best",
+            "최고 속도",
+            "지금 최고 속도로 충전 중이에요",
+            "이 휴대폰이 받아본 가장 빠른 속도와 비슷해요. 따로 막는 원인이 없어요.",
         )
-        nearMax -> Triple(
-            "없음",
-            "충전기 성능을 거의 다 쓰고 있어요",
-            "지금은 특별한 제한 없이 빠르게 충전 중이에요.",
+        s.chargeType.isWireless -> Reason(
+            "wireless",
+            "무선",
+            "무선 충전은 원래 느려요",
+            "코일로 전달하면서 손실이 크고, 무선 최대 속도도 유선보다 낮아요. 휴대폰 위치가 어긋나면 더 느려져요.",
         )
-        t >= 40 || thermal >= PowerManager.THERMAL_STATUS_SEVERE -> Triple(
-            "온도",
-            "온도가 높아서 속도를 낮췄어요",
-            "배터리가 ${t.f1()}°C예요. 열을 줄이려고 휴대폰이 충전 전류를 줄였어요. " +
-                "케이스를 빼거나 시원한 곳에 두면 빨라져요.",
+        tempC >= 40 || thermal >= PowerManager.THERMAL_STATUS_SEVERE -> Reason(
+            "hot",
+            "온도 높음",
+            "배터리가 뜨거워서 느려졌어요",
+            "배터리가 ${tempC.f1()}°C예요. 휴대폰이 열을 줄이려고 충전을 늦췄어요. 케이스를 빼거나 시원한 곳에 두면 빨라져요.",
         )
-        level >= 80 -> Triple(
-            "잔량 80%+",
-            "배터리 보호 구간이에요 (80% 이상)",
-            "배터리가 거의 차면 수명을 지키려고 전류를 크게 줄여요. 정상이에요.",
+        level >= 80 -> Reason(
+            "full",
+            "80% 이상",
+            "거의 다 차서 천천히 채우는 중이에요",
+            "80%가 넘으면 배터리 수명을 지키려고 일부러 천천히 충전해요. 정상이에요.",
         )
-        t >= 37 || thermal >= PowerManager.THERMAL_STATUS_MODERATE -> Triple(
-            "온도",
-            "온도 때문에 조금 낮췄을 수 있어요",
-            "배터리가 ${t.f1()}°C로 따뜻해요. 많은 휴대폰이 37~40°C쯤부터 충전 속도를 줄여요.",
-        )
-        level >= 50 -> Triple(
-            "잔량 50%+",
-            "충전이 점점 느려지는 구간이에요",
-            "초고속 충전은 잔량이 낮을 때 가장 빠르고, 50%를 넘으면 단계적으로 줄어요. 정상이에요.",
-        )
-        interactive && t >= 35 -> Triple(
+        interactive && tempC >= 35 -> Reason(
+            "screen_warm",
             "화면+온도",
-            "화면 켜짐 + 따뜻한 배터리 (${t.f1()}°C)",
-            "화면이 켜진 채 배터리가 35°C를 넘으면 많은 휴대폰(특히 삼성)이 발열을 막으려고 충전 전류를 크게 줄여요. " +
-                "화면을 끄면 보통 다시 빨라져요. 백그라운드 측정을 켜고 1~2분 끈 뒤 그래프로 확인해보세요.",
+            "화면을 켜둬서 + 배터리가 따뜻해서 느려졌어요",
+            "화면이 켜진 채 배터리가 35°C를 넘으면 많은 휴대폰(특히 삼성)이 발열을 막으려고 충전을 줄여요. " +
+                "화면을 끄면 보통 다시 빨라져요.",
         )
-        interactive -> Triple(
-            "화면 사용",
-            "화면을 켜고 쓰는 중이에요",
-            "쓰는 전력(약 ${usageW.f1()}W)만큼 배터리로 덜 가고, 일부 기종은 사용 중 발열을 줄이려 충전 속도를 낮춰요. " +
-                "백그라운드 측정을 켜고 화면을 1~2분 끈 뒤 그래프를 보면 차이를 알 수 있어요.",
+        tempC >= 37 || thermal >= PowerManager.THERMAL_STATUS_MODERATE -> Reason(
+            "warm",
+            "온도",
+            "배터리가 따뜻해서 조금 느려졌어요",
+            "배터리가 ${tempC.f1()}°C예요. 많은 휴대폰이 37~40°C쯤부터 충전을 줄여요.",
         )
-        else -> Triple(
-            "기종/케이블",
-            "휴대폰이나 케이블 한계로 보여요",
-            "잔량·온도는 문제없어요. 이 기종의 최대 속도이거나, 케이블이 고속 충전(3A 이상)을 지원하지 않을 수 있어요.",
+        level >= 50 -> Reason(
+            "half",
+            "50% 이상",
+            "절반 넘게 차서 속도가 줄어드는 중이에요",
+            "고속 충전은 배터리가 비어 있을 때 가장 빠르고, 50%가 넘으면 단계적으로 줄어요. 정상이에요.",
+        )
+        interactive -> Reason(
+            "screen",
+            "화면 켜짐",
+            "화면을 켜둬서 조금 느려졌어요",
+            "휴대폰이 쓰는 전력(약 ${usageW.f1()}W)만큼 배터리로 덜 들어가요. 화면을 끄면 그만큼 빨라져요.",
+        )
+        bestW == null -> Reason(
+            "learning",
+            "기록 중",
+            "최고 속도를 기록하는 중이에요",
+            "백그라운드 측정을 켜고, 배터리가 낮을 때 화면을 끈 채 1분쯤 충전하면 이 휴대폰의 최고 속도가 기록돼요. 그다음부터 비교해서 알려드려요.",
+        )
+        else -> Reason(
+            "device",
+            "원인 불명",
+            "뚜렷한 원인이 안 보여요",
+            "잔량·온도·화면은 문제없어요. 케이블이 고속 충전(3A 이상)을 지원하는지 확인해보세요.",
         )
     }
+}
 
-    val factors = buildList {
+fun buildFactors(s: BatterySnapshot, tempC: Double, usageW: Double, interactive: Boolean): List<Factor> {
+    val level = s.levelPercent
+    val thermal = s.thermalStatus
+    return buildList {
         add(
             when {
-                s.chargeType == ChargeType.WIRED_USB ->
-                    Factor("충전 방식", "USB 포트", "컴퓨터 등은 출력이 작아요", Level.WARN)
-                s.chargeType.isWireless ->
-                    Factor("충전 방식", "무선", "손실 약 30%, 최대 속도 낮음", Level.INFO)
+                s.chargeType == ChargeType.WIRED_USB -> Factor("충전 방식", "USB 포트", "출력이 작아요", Level.WARN)
+                s.chargeType.isWireless -> Factor("충전 방식", "무선", "유선보다 느려요", Level.INFO)
                 else -> Factor("충전 방식", "유선", "가장 빠른 방식", Level.OK)
             },
         )
         add(
             when {
-                level >= 80 -> Factor("배터리 잔량", "$level%", "보호를 위해 천천히 충전", Level.WARN)
-                level >= 50 -> Factor("배터리 잔량", "$level%", "점점 느려지는 구간", Level.INFO)
+                level >= 80 -> Factor("배터리 잔량", "$level%", "거의 다 차서 천천히 충전", Level.WARN)
+                level >= 50 -> Factor("배터리 잔량", "$level%", "속도가 줄어드는 구간", Level.INFO)
                 else -> Factor("배터리 잔량", "$level%", "가장 빠른 구간", Level.OK)
             },
         )
         add(
             when {
-                t >= 40 -> Factor("배터리 온도", "${t.f1()}°C", "높음, 속도 제한 가능성 큼", Level.WARN)
-                t >= 37 -> Factor("배터리 온도", "${t.f1()}°C", "따뜻함, 약간 제한될 수 있음", Level.INFO)
-                t >= 35 && interactive ->
-                    Factor("배터리 온도", "${t.f1()}°C", "화면 켜진 상태에선 제한될 수 있음", Level.INFO)
-                else -> Factor("배터리 온도", "${t.f1()}°C", "문제없음", Level.OK)
+                tempC >= 40 -> Factor("배터리 온도", "${tempC.f1()}°C", "뜨거움, 충전이 많이 줄어요", Level.WARN)
+                tempC >= 37 -> Factor("배터리 온도", "${tempC.f1()}°C", "따뜻함, 조금 줄 수 있어요", Level.INFO)
+                tempC >= 35 && interactive ->
+                    Factor("배터리 온도", "${tempC.f1()}°C", "화면 켜져 있으면 줄 수 있어요", Level.INFO)
+                tempC >= 35 -> Factor("배터리 온도", "${tempC.f1()}°C", "조금 따뜻함, 화면 꺼져 있으면 괜찮아요", Level.INFO)
+                else -> Factor("배터리 온도", "${tempC.f1()}°C", "괜찮아요", Level.OK)
             },
         )
-        if (s.thermalStatus != null) {
+        if (thermal != null) {
             add(
                 when {
                     thermal >= PowerManager.THERMAL_STATUS_SEVERE ->
-                        Factor("기기 발열", "높음", "휴대폰이 성능·충전을 제한 중", Level.WARN)
+                        Factor("휴대폰 발열", "높음", "휴대폰이 충전을 줄이는 중", Level.WARN)
                     thermal >= PowerManager.THERMAL_STATUS_MODERATE ->
-                        Factor("기기 발열", "보통", "일부 제한될 수 있음", Level.INFO)
-                    else -> Factor("기기 발열", "정상", "문제없음", Level.OK)
+                        Factor("휴대폰 발열", "보통", "조금 줄 수 있어요", Level.INFO)
+                    else -> Factor("휴대폰 발열", "정상", "괜찮아요", Level.OK)
                 },
             )
         }
         add(
             if (interactive) {
-                Factor("화면 사용", "켜짐", "약 ${usageW.f1()}W를 휴대폰이 사용", Level.INFO)
+                Factor("화면", "켜짐", "약 ${usageW.f1()}W를 휴대폰이 써요", Level.INFO)
             } else {
-                Factor("화면 사용", "꺼짐", "배터리로 최대한 들어감", Level.OK)
+                Factor("화면", "꺼짐", "괜찮아요", Level.OK)
             },
         )
-        if (notCharging) add(Factor("충전 상태", "멈춤", "배터리 보호 설정 확인", Level.WARN))
-        if (peak >= batteryW * 1.3 && peak >= 5) {
-            add(Factor("이번 충전 최대", "${peak.f1()}W", "충전기·케이블은 더 빠르게도 돼요", Level.OK))
-        }
     }
-
-    return Diagnosis(chargerW, batteryW, usageW, lossW, unusedW, short, headline, detail, factors)
 }

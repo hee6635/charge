@@ -15,7 +15,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -23,8 +22,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -85,7 +82,7 @@ fun ChargeScreen(
     keepScreenOn: Boolean,
     onKeepScreenOnChange: (Boolean) -> Unit,
     onBackgroundChange: (Boolean) -> Unit,
-    onChargerWChange: (Int) -> Unit,
+    onResetBest: () -> Unit,
     onClearHistory: () -> Unit,
 ) {
     Scaffold { padding ->
@@ -102,7 +99,7 @@ fun ChargeScreen(
                 Text("배터리 정보를 읽는 중…", modifier = Modifier.padding(24.dp))
             } else {
                 MainContent(
-                    state, s, keepScreenOn, onKeepScreenOnChange, onBackgroundChange, onChargerWChange, onClearHistory,
+                    state, s, keepScreenOn, onKeepScreenOnChange, onBackgroundChange, onResetBest, onClearHistory,
                 )
             }
         }
@@ -116,7 +113,7 @@ private fun MainContent(
     keepScreenOn: Boolean,
     onKeepScreenOnChange: (Boolean) -> Unit,
     onBackgroundChange: (Boolean) -> Unit,
-    onChargerWChange: (Int) -> Unit,
+    onResetBest: () -> Unit,
     onClearHistory: () -> Unit,
 ) {
     val times = state.samples.map { it.timeMs }
@@ -131,14 +128,14 @@ private fun MainContent(
         checked = state.backgroundEnabled,
         onChange = onBackgroundChange,
     )
-    MetricsGrid(s)
-    state.diagnosis?.let { DiagnosisCard(it, onChargerWChange) }
+    MetricsGrid(s, state.avgW10, state.avgA10)
+    state.diagnosis?.let { DiagnosisCard(it, onResetBest) }
     EstimateCard(state, s)
     LineChart(
-        title = "전력 (W) · 최근 5분",
+        title = "전력 (W, 10초 평균) · 최근 5분",
         unit = "W",
         times = times,
-        values = state.samples.map { it.powerW.toFloat() },
+        values = smooth(state.samples, 10_000) { it.powerW },
         color = MaterialTheme.colorScheme.primary,
         decimals = 1,
     )
@@ -162,7 +159,7 @@ private fun MainContent(
     )
     Text(
         "· 값은 휴대폰 배터리 센서 기준이며, 기기마다 정확도가 다를 수 있어요.\n" +
-            "· 충전 진단의 사용 전력·열 손실은 추정치예요. 배터리 전력만 실제 측정값이에요.",
+            "· 화면을 켜둘 때 휴대폰이 쓰는 전력은 추정치예요.",
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
@@ -214,18 +211,40 @@ private fun HeaderCard(s: BatterySnapshot) {
 }
 
 @Composable
-private fun MetricsGrid(s: BatterySnapshot) {
+private fun MetricsGrid(s: BatterySnapshot, avgW10: Double, avgA10: Double) {
     val temp = tempLevel(s.temperatureC)
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            MetricTile("전력", s.powerW.f(2), "W", Modifier.weight(1f), big = true)
+            MetricTile(
+                "전력 · 10초 평균", avgW10.f(1), "W", Modifier.weight(1f), big = true,
+                sub = "순간 ${s.powerW.f(2)} W",
+            )
             MetricTile("온도", s.temperatureC.f(1), "°C", Modifier.weight(1f), big = true, badge = temp)
         }
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            MetricTile("전압", s.voltageV.f(3), "V", Modifier.weight(1f))
-            MetricTile("전류", s.currentA.f(3), "A", Modifier.weight(1f))
+            MetricTile("전압", s.voltageV.f(2), "V", Modifier.weight(1f))
+            MetricTile(
+                "전류 · 10초 평균", avgA10.f(2), "A", Modifier.weight(1f),
+                sub = "순간 ${s.currentA.f(2)} A",
+            )
         }
     }
+}
+
+/** 각 점마다 직전 windowMs 동안의 평균 (그래프용) */
+private fun smooth(samples: List<Sample>, windowMs: Long, pick: (Sample) -> Double): List<Float> {
+    val out = ArrayList<Float>(samples.size)
+    var start = 0
+    var sum = 0.0
+    samples.forEachIndexed { i, smp ->
+        sum += pick(smp)
+        while (smp.timeMs - samples[start].timeMs > windowMs) {
+            sum -= pick(samples[start])
+            start++
+        }
+        out += (sum / (i - start + 1)).toFloat()
+    }
+    return out
 }
 
 @Composable
@@ -236,6 +255,7 @@ private fun MetricTile(
     modifier: Modifier = Modifier,
     big: Boolean = false,
     badge: TempLevel? = null,
+    sub: String? = null,
 ) {
     Card(
         modifier = modifier,
@@ -259,6 +279,9 @@ private fun MetricTile(
                 )
                 Spacer(Modifier.width(4.dp))
                 Text(unit, modifier = Modifier.padding(bottom = 4.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            sub?.let {
+                Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }
@@ -580,72 +603,59 @@ private fun ToggleCard(title: String, subtitle: String, checked: Boolean, onChan
     }
 }
 
-private val BatteryColor = Color(0xFF2F6FDE)
-private val UsageColor = Color(0xFF14A38B)
-private val LossColor = Color(0xFFE08A1E)
-
-private val ChargerOptions = listOf(10, 15, 25, 45, 65)
-
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun DiagnosisCard(d: Diagnosis, onChargerWChange: (Int) -> Unit) {
+private fun DiagnosisCard(d: Diagnosis, onResetBest: () -> Unit) {
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
-    val unusedColor = MaterialTheme.colorScheme.outlineVariant
+    var confirmReset by remember { mutableStateOf(false) }
     SectionCard {
-        Text(
-            "왜 ${d.chargerW}W가 다 안 들어올까?",
-            style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.Bold,
-        )
+        Text("충전 속도 진단", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(8.dp))
-        Text(d.headline, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(4.dp))
-        Text(d.detail, style = MaterialTheme.typography.bodyMedium)
 
-        // 충전기 출력이 어디로 갔는지 나눠 보여주는 막대
-        Spacer(Modifier.height(16.dp))
-        val parts = listOf(
-            Triple("배터리로 들어감", d.batteryW, BatteryColor),
-            Triple("휴대폰 사용 (추정)", d.usageW, UsageColor),
-            Triple("열 손실 (추정)", d.lossW, LossColor),
-            Triple("충전기 여유 (휴대폰이 안 받음)", d.unusedW, unusedColor),
-        )
-        val total = parts.sumOf { it.second }.coerceAtLeast(d.chargerW.toDouble()).coerceAtLeast(0.1)
-        Canvas(Modifier.fillMaxWidth().height(20.dp)) {
-            val gap = 2.dp.toPx()
-            val radius = androidx.compose.ui.geometry.CornerRadius(4.dp.toPx())
-            var x = 0f
-            parts.forEach { (_, w, c) ->
-                val segW = (w / total * size.width).toFloat()
-                if (segW >= 1f) {
-                    drawRoundRect(
-                        color = c,
-                        topLeft = Offset(x, 0f),
-                        size = androidx.compose.ui.geometry.Size((segW - gap).coerceAtLeast(1f), size.height),
-                        cornerRadius = radius,
-                    )
-                }
-                x += segW
-            }
-        }
-        Spacer(Modifier.height(8.dp))
-        parts.forEach { (label, w, c) ->
-            Row(Modifier.fillMaxWidth().padding(vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
-                Box(Modifier.size(10.dp).background(c, RoundedCornerShape(2.dp)))
+        // 1) 지금 속도가 이 휴대폰 최고 기록의 몇 %인지
+        val ratio = d.ratio
+        Row(verticalAlignment = Alignment.Bottom) {
+            Text(
+                if (ratio != null) "${(ratio * 100).roundToInt()}%" else d.speedLabel,
+                style = MaterialTheme.typography.displaySmall,
+                fontWeight = FontWeight.Bold,
+            )
+            if (ratio != null) {
                 Spacer(Modifier.width(8.dp))
-                Text(label, color = muted, modifier = Modifier.weight(1f))
-                Text("${w.f(1)} W", fontWeight = FontWeight.Medium)
+                Text(
+                    "최고 기록 대비 · ${d.speedLabel}",
+                    color = muted,
+                    modifier = Modifier.padding(bottom = 6.dp),
+                )
             }
         }
-
+        if (ratio != null) {
+            Spacer(Modifier.height(8.dp))
+            LinearProgressIndicator(
+                progress = { ratio.toFloat() },
+                modifier = Modifier.fillMaxWidth().height(10.dp),
+                strokeCap = StrokeCap.Round,
+                gapSize = 0.dp,
+                drawStopIndicator = {},
+            )
+            Spacer(Modifier.height(6.dp))
+        }
         Text(
-            "충전기 최대치는 잔량이 낮고 화면이 꺼져 있을 때 잠깐만 나와요. 회색이 어느 정도 남는 건 정상이에요.",
+            buildString {
+                append("지금 ${d.nowW.f(1)} W")
+                d.bestW?.let { append(" · 이 휴대폰 최고 ${it.f(1)} W") }
+                append(" (30초 평균)")
+            },
             style = MaterialTheme.typography.bodySmall,
             color = muted,
-            modifier = Modifier.padding(top = 4.dp),
         )
 
-        // 원인 체크리스트
+        // 2) 느린 이유 (15초 넘게 같은 원인일 때만 바뀜)
+        HorizontalDivider(Modifier.padding(vertical = 12.dp))
+        Text(d.reason.headline, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(4.dp))
+        Text(d.reason.detail, style = MaterialTheme.typography.bodyMedium)
+
+        // 3) 체크리스트
         HorizontalDivider(Modifier.padding(vertical = 12.dp))
         d.factors.forEach { f ->
             val (mark, color) = when (f.level) {
@@ -669,22 +679,27 @@ private fun DiagnosisCard(d: Diagnosis, onChargerWChange: (Int) -> Unit) {
             }
         }
 
-        // 충전기 출력 선택
         HorizontalDivider(Modifier.padding(vertical = 12.dp))
-        Text("내 충전기 최대 출력", style = MaterialTheme.typography.labelLarge, color = muted)
-        Spacer(Modifier.height(4.dp))
-        Row(
-            modifier = Modifier.horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            ChargerOptions.forEach { w ->
-                FilterChip(
-                    selected = d.chargerW == w,
-                    onClick = { onChargerWChange(w) },
-                    label = { Text("${w}W") },
-                )
-            }
+        Text(
+            "충전기에 적힌 W(예: 25W)는 '최대' 출력이에요. 휴대폰은 잔량·온도·화면 상태에 따라 필요한 만큼만 받아서, " +
+                "그 숫자가 그대로 들어오지는 않아요. 그래서 이 앱은 이 휴대폰이 실제로 받아본 최고 속도와 비교해요.",
+            style = MaterialTheme.typography.bodySmall,
+            color = muted,
+        )
+        if (d.bestW != null) {
+            TextButton(onClick = { confirmReset = true }) { Text("최고 기록 초기화") }
         }
+    }
+    if (confirmReset) {
+        AlertDialog(
+            onDismissRequest = { confirmReset = false },
+            title = { Text("최고 기록을 지울까요?") },
+            text = { Text("충전기나 케이블을 바꿨을 때 쓰세요. 다음 충전부터 다시 기록해요.") },
+            confirmButton = {
+                TextButton(onClick = { onResetBest(); confirmReset = false }) { Text("초기화") }
+            },
+            dismissButton = { TextButton(onClick = { confirmReset = false }) { Text("취소") } },
+        )
     }
 }
 

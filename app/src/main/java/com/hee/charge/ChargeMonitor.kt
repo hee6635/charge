@@ -25,7 +25,9 @@ data class UiState(
     val estimateMinutes: Double? = null,
     val capacityMah: Double? = null,
     val diagnosis: Diagnosis? = null,
-    val chargerW: Int = 25,
+    /** 10초 평균 (순간값은 너무 출렁여서 화면에는 이걸 크게 보여준다) */
+    val avgW10: Double = 0.0,
+    val avgA10: Double = 0.0,
     val backgroundEnabled: Boolean = false,
 )
 
@@ -59,6 +61,11 @@ object ChargeMonitor {
     private var lastType: ChargeType? = null
     private var typeChangedMs = 0L
 
+    // 원인 표시가 자주 바뀌지 않게: 새 원인이 15초 이상 이어질 때만 바꾼다
+    private var shownReason: Reason? = null
+    private var candidateKey: String? = null
+    private var candidateSinceMs = 0L
+
     fun init(context: Context) {
         if (::reader.isInitialized) return
         val app = context.applicationContext
@@ -69,7 +76,6 @@ object ChargeMonitor {
         usageW = settings.usageW
         _state.value = UiState(
             history = store.load(),
-            chargerW = settings.chargerW,
             backgroundEnabled = settings.backgroundEnabled,
         )
     }
@@ -98,9 +104,8 @@ object ChargeMonitor {
         }
     }
 
-    fun setChargerW(w: Int) {
-        settings.chargerW = w
-        _state.value = _state.value.copy(chargerW = w)
+    fun resetBest() {
+        settings.resetBest()
         _state.value.snapshot?.let { recompute(it) }
     }
 
@@ -163,9 +168,17 @@ object ChargeMonitor {
         recompute(s)
     }
 
+    private fun avgOf(s: BatterySnapshot, windowMs: Long, pick: (Sample) -> Double): Double? {
+        val recent = samples.filter { s.timeMs - it.timeMs <= windowMs }
+        return if (recent.isEmpty()) null else recent.sumOf(pick) / recent.size
+    }
+
     private fun recompute(s: BatterySnapshot) {
-        val recent = samples.filter { s.timeMs - it.timeMs <= 30_000 }
-        val avgA = if (recent.isEmpty()) max(s.currentA, 0.0) else recent.sumOf { it.currentA } / recent.size
+        val avgW10 = avgOf(s, 10_000) { it.powerW } ?: s.powerW
+        val avgA10 = avgOf(s, 10_000) { it.currentA } ?: s.currentA
+        val avgA30 = avgOf(s, 30_000) { it.currentA } ?: s.currentA
+        val avgW30 = avgOf(s, 30_000) { it.powerW } ?: s.powerW
+        val avgTemp30 = avgOf(s, 30_000) { it.tempC } ?: s.temperatureC
 
         val capacity = s.chargeCounterMah
             ?.takeIf { s.levelPercent in 5..100 }
@@ -173,18 +186,30 @@ object ChargeMonitor {
             ?.takeIf { it in 500.0..30_000.0 }
 
         val charging = s.chargeType.isCharging && !s.isFull
-        val estimate = if (charging && avgA > 0.05 && capacity != null) {
-            capacity * (100 - s.levelPercent) / 100.0 / 1000.0 / avgA * 60.0
+        val estimate = if (charging && avgA30 > 0.05 && capacity != null) {
+            capacity * (100 - s.levelPercent) / 100.0 / 1000.0 / avgA30 * 60.0
         } else {
             null
         }
 
-        val liveSession = live?.toSession()
+        // 최고 기록은 "좋은 조건"(화면 꺼짐, 80% 미만)에서 30초 넘게 안정적으로 잰 값만 쓴다
+        val wireless = s.chargeType.isWireless
         val interactive = pm.isInteractive
+        val goodCondition = !interactive && s.levelPercent < 80 && s.chargeType != ChargeType.WIRED_USB
+        if (charging && goodCondition && s.timeMs - typeChangedMs >= 33_000 && avgW30 > 0) {
+            val best = settings.bestW(wireless)
+            if (best == null || avgW30 > best) settings.setBestW(wireless, avgW30)
+        }
+
+        val liveSession = live?.toSession()
         val usage = if (interactive) usageW ?: DEFAULT_USAGE_W else SCREEN_OFF_USAGE_W
         val diagnosis = if (charging) {
-            diagnose(s, liveSession, _state.value.chargerW, usage, interactive)
+            val bestW = settings.bestW(wireless)
+            val reason = stableReason(pickReason(s, avgW30, bestW, avgTemp30, usage, interactive), s.timeMs)
+            Diagnosis(avgW30, bestW, reason, buildFactors(s, avgTemp30, usage, interactive))
         } else {
+            shownReason = null
+            candidateKey = null
             null
         }
 
@@ -192,11 +217,32 @@ object ChargeMonitor {
             snapshot = s,
             samples = samples.toList(),
             live = liveSession,
-            avgCurrentA = avgA,
+            avgCurrentA = avgA30,
             estimateMinutes = estimate,
             capacityMah = capacity,
             diagnosis = diagnosis,
+            avgW10 = avgW10,
+            avgA10 = avgA10,
         )
+    }
+
+    private fun stableReason(next: Reason, now: Long): Reason {
+        val shown = shownReason
+        if (shown == null || shown.key == next.key) {
+            shownReason = next
+            candidateKey = null
+            return next
+        }
+        if (candidateKey != next.key) {
+            candidateKey = next.key
+            candidateSinceMs = now
+        }
+        if (now - candidateSinceMs >= 15_000) {
+            shownReason = next
+            candidateKey = null
+            return next
+        }
+        return shown
     }
 
     /** 1분 넘게 충전한 경우만 기록에 남긴다. */

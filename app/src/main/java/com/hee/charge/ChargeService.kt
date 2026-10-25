@@ -66,10 +66,10 @@ class ChargeService : Service() {
         val text: String
         if (s.chargeType.isCharging) {
             val icon = if (s.chargeType.isWireless) "무선" else "유선"
-            title = "$icon · ${s.powerW.f(1)} W · ${s.temperatureC.f(1)}°C · ${s.levelPercent}%"
+            title = "$icon · ${state.avgW10.f(1)} W · ${s.temperatureC.f(1)}°C · ${s.levelPercent}%"
             val parts = mutableListOf<String>()
             state.estimateMinutes?.let { parts += "완충까지 약 ${minutes(it)}" }
-            state.diagnosis?.let { if (it.reasonShort != "없음") parts += "제한: ${it.reasonShort}" }
+            state.diagnosis?.let { if (it.reason.key != "best") parts += "느린 이유: ${it.reason.short}" }
             text = parts.joinToString(" · ").ifEmpty { "충전 중" }
         } else {
             title = "충전 안 함 · ${s.levelPercent}% · ${s.temperatureC.f(1)}°C"
