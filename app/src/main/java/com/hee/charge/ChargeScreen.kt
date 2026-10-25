@@ -2,6 +2,15 @@ package com.hee.charge
 
 import android.os.BatteryManager
 import android.os.PowerManager
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -53,6 +62,17 @@ import java.util.Locale
 import kotlin.math.roundToInt
 
 private fun Double.f(digits: Int) = String.format(Locale.US, "%.${digits}f", this)
+
+/** 숫자가 툭 바뀌지 않고 0.8초 동안 부드럽게 따라가게 한다 */
+@Composable
+private fun smoothly(target: Double): Double {
+    val v by animateFloatAsState(
+        targetValue = target.toFloat(),
+        animationSpec = tween(durationMillis = 800, easing = FastOutSlowInEasing),
+        label = "smooth",
+    )
+    return v.toDouble()
+}
 
 private fun minutesText(min: Double): String {
     val total = min.roundToInt().coerceAtLeast(0)
@@ -173,7 +193,7 @@ private fun SectionCard(content: @Composable () -> Unit) {
         shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
     ) {
-        Column(Modifier.padding(16.dp)) { content() }
+        Column(Modifier.animateContentSize().padding(16.dp)) { content() }
     }
 }
 
@@ -197,11 +217,16 @@ private fun HeaderCard(s: BatterySnapshot) {
                 Text(s.chargeType.label, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                 Text(statusText, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            Text("${s.levelPercent}%", style = MaterialTheme.typography.displaySmall, fontWeight = FontWeight.Bold)
+            Text(
+                "${smoothly(s.levelPercent.toDouble()).roundToInt()}%",
+                style = MaterialTheme.typography.displaySmall,
+                fontWeight = FontWeight.Bold,
+            )
         }
         Spacer(Modifier.height(12.dp))
+        val level = smoothly(s.levelPercent.toDouble()).toFloat()
         LinearProgressIndicator(
-            progress = { s.levelPercent / 100f },
+            progress = { level / 100f },
             modifier = Modifier.fillMaxWidth().height(8.dp),
             strokeCap = StrokeCap.Round,
             gapSize = 0.dp,
@@ -216,15 +241,15 @@ private fun MetricsGrid(s: BatterySnapshot, avgW10: Double, avgA10: Double) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             MetricTile(
-                "전력 · 10초 평균", avgW10.f(1), "W", Modifier.weight(1f), big = true,
+                "전력 · 10초 평균", smoothly(avgW10).f(1), "W", Modifier.weight(1f), big = true,
                 sub = "순간 ${s.powerW.f(2)} W",
             )
-            MetricTile("온도", s.temperatureC.f(1), "°C", Modifier.weight(1f), big = true, badge = temp)
+            MetricTile("온도", smoothly(s.temperatureC).f(1), "°C", Modifier.weight(1f), big = true, badge = temp)
         }
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            MetricTile("전압", s.voltageV.f(2), "V", Modifier.weight(1f))
+            MetricTile("전압", smoothly(s.voltageV).f(2), "V", Modifier.weight(1f))
             MetricTile(
-                "전류 · 10초 평균", avgA10.f(2), "A", Modifier.weight(1f),
+                "전류 · 10초 평균", smoothly(avgA10).f(2), "A", Modifier.weight(1f),
                 sub = "순간 ${s.currentA.f(2)} A",
             )
         }
@@ -266,7 +291,8 @@ private fun MetricTile(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(label, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.weight(1f))
                 badge?.let {
-                    Box(Modifier.size(8.dp).background(it.color, CircleShape))
+                    val dot by animateColorAsState(it.color, tween(800), label = "badge")
+                    Box(Modifier.size(8.dp).background(dot, CircleShape))
                     Spacer(Modifier.width(4.dp))
                     Text(it.label, style = MaterialTheme.typography.labelMedium)
                 }
@@ -366,8 +392,8 @@ private fun ChartBody(
         val minV = values.min()
         val maxV = values.max()
         val range = (maxV - minV).coerceAtLeast(0.5f)
-        val lo = minV - range * 0.1f
-        val hi = maxV + range * 0.1f
+        val lo by animateFloatAsState(minV - range * 0.1f, tween(600), label = "lo")
+        val hi by animateFloatAsState(maxV + range * 0.1f, tween(600), label = "hi")
 
         // 측정 간격이 1초/2초로 바뀔 수 있어서 가로축은 실제 시각 기준
         val t0 = times.first()
@@ -421,8 +447,17 @@ private fun ChartBody(
             }
 
             val path = Path()
-            values.forEachIndexed { i, v ->
-                if (i == 0) path.moveTo(x(i), y(v)) else path.lineTo(x(i), y(v))
+            // 점 사이를 곡선으로 이어서 꺾임 없이 보이게
+            var prevX = x(0)
+            var prevY = y(values[0])
+            path.moveTo(prevX, prevY)
+            for (i in 1 until values.size) {
+                val cx = x(i)
+                val cy = y(values[i])
+                val mx = (prevX + cx) / 2f
+                path.cubicTo(mx, prevY, mx, cy, cx, cy)
+                prevX = cx
+                prevY = cy
             }
             drawPath(path, color, style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round))
 
@@ -613,9 +648,11 @@ private fun DiagnosisCard(d: Diagnosis, onResetBest: () -> Unit) {
 
         // 1) 지금 속도가 이 휴대폰 최고 기록의 몇 %인지
         val ratio = d.ratio
+        val shownRatio = smoothly(ratio ?: 0.0)
+        val shownNowW = smoothly(d.nowW)
         Row(verticalAlignment = Alignment.Bottom) {
             Text(
-                if (ratio != null) "${(ratio * 100).roundToInt()}%" else d.speedLabel,
+                if (ratio != null) "${(shownRatio * 100).roundToInt()}%" else d.speedLabel,
                 style = MaterialTheme.typography.displaySmall,
                 fontWeight = FontWeight.Bold,
             )
@@ -631,7 +668,7 @@ private fun DiagnosisCard(d: Diagnosis, onResetBest: () -> Unit) {
         if (ratio != null) {
             Spacer(Modifier.height(8.dp))
             LinearProgressIndicator(
-                progress = { ratio.toFloat() },
+                progress = { shownRatio.toFloat() },
                 modifier = Modifier.fillMaxWidth().height(10.dp),
                 strokeCap = StrokeCap.Round,
                 gapSize = 0.dp,
@@ -641,7 +678,7 @@ private fun DiagnosisCard(d: Diagnosis, onResetBest: () -> Unit) {
         }
         Text(
             buildString {
-                append("지금 ${d.nowW.f(1)} W")
+                append("지금 ${shownNowW.f(1)} W")
                 d.bestW?.let { append(" · 이 휴대폰 최고 ${it.f(1)} W") }
                 append(" (30초 평균)")
             },
@@ -651,9 +688,18 @@ private fun DiagnosisCard(d: Diagnosis, onResetBest: () -> Unit) {
 
         // 2) 느린 이유 (15초 넘게 같은 원인일 때만 바뀜)
         HorizontalDivider(Modifier.padding(vertical = 12.dp))
-        Text(d.reason.headline, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(4.dp))
-        Text(d.reason.detail, style = MaterialTheme.typography.bodyMedium)
+        AnimatedContent(
+            targetState = d.reason,
+            contentKey = { it.key },
+            transitionSpec = { fadeIn(tween(600)) togetherWith fadeOut(tween(400)) },
+            label = "reason",
+        ) { reason ->
+            Column {
+                Text(reason.headline, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(4.dp))
+                Text(reason.detail, style = MaterialTheme.typography.bodyMedium)
+            }
+        }
 
         // 3) 체크리스트
         HorizontalDivider(Modifier.padding(vertical = 12.dp))
