@@ -16,6 +16,16 @@ android {
         versionName = "1.0"
     }
 
+    // 고정 서명 키: 빌드할 때마다 키가 바뀌면 업데이트 설치가 안 되기 때문
+    signingConfigs {
+        getByName("debug") {
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
