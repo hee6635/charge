@@ -608,7 +608,7 @@ private fun DiagnosisCard(d: Diagnosis, onChargerWChange: (Int) -> Unit) {
             Triple("배터리로 들어감", d.batteryW, BatteryColor),
             Triple("휴대폰 사용 (추정)", d.usageW, UsageColor),
             Triple("열 손실 (추정)", d.lossW, LossColor),
-            Triple("받지 못한 양", d.unusedW, unusedColor),
+            Triple("충전기 여유 (휴대폰이 안 받음)", d.unusedW, unusedColor),
         )
         val total = parts.sumOf { it.second }.coerceAtLeast(d.chargerW.toDouble()).coerceAtLeast(0.1)
         Canvas(Modifier.fillMaxWidth().height(20.dp)) {
@@ -637,6 +637,13 @@ private fun DiagnosisCard(d: Diagnosis, onChargerWChange: (Int) -> Unit) {
                 Text("${w.f(1)} W", fontWeight = FontWeight.Medium)
             }
         }
+
+        Text(
+            "충전기 최대치는 잔량이 낮고 화면이 꺼져 있을 때 잠깐만 나와요. 회색이 어느 정도 남는 건 정상이에요.",
+            style = MaterialTheme.typography.bodySmall,
+            color = muted,
+            modifier = Modifier.padding(top = 4.dp),
+        )
 
         // 원인 체크리스트
         HorizontalDivider(Modifier.padding(vertical = 12.dp))
